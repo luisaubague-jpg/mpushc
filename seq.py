@@ -256,7 +256,8 @@ def set_tune(note, semitones):
 padp = {n: {"volume": 100, "pan": 0, "swing": None, "humanize": None, "velocity": 116,
             "mode": "one-shot", "choke": 0, "mono_sum": False, "colour": 0,
             "root": 60, "fine": 0, "stretch": None, "style": "classic",
-            "loop_bpm": None, "bus": None, "inst": None, "ip": None, "fx": None, "vary": 0} for n in KIT_ALL}
+            "loop_bpm": None, "bus": None, "inst": None, "ip": None, "fx": None, "vary": 0, "tone": 0}
+        for n in KIT_ALL}
 # vary: 0-100 cents. Each hit plays one of a few slightly detuned copies (Settings · PAD).
 # style: "classic" = speed and pitch move together (SP-404 / MPC60 repitch);
 #        "modern"  = time-stretch: tempo and pitch are independent (Signalsmith Stretch).
@@ -678,40 +679,63 @@ def inst_render(pid, n, length):
     return audio
 
 
-VARY_SPREAD = (-1.0, -0.5, 0.0, 0.5, 1.0)          # the copies, as shares of VARY (0 = as tuned)
-vary_cache = {}                                    # pad -> ((source id, cents), [audio per copy])
+VARY_SPREAD = (-1.0, -0.5, 0.0, 0.5, 1.0)          # VARY copies, as shares of VARY (0 = as tuned)
+TONE_LEVELS = 4                                    # VEL TONE: hard hits as recorded ... soft hits darkest
+VARIANT_MAX_LEN = 10 * SR                          # longer samples (loops) skip VARY / VEL TONE
+vary_cache = {}                                    # pad -> (key, [tone level][vary copy] audio)
 vary_jobs = {}                                     # pad -> key being made in the background
 
 
-def vary_pick(note):
-    """A pad's audio for one hit: a random detuned copy when VARY is on and ready."""
+def variant_key(pid):
+    return (id(pitched[pid]), padp[pid].get("vary", 0), padp[pid].get("tone", 0))
+
+
+def tone_level(gain):
+    """Velocity gain (0-1) -> 0 = as recorded (hard hit) ... TONE_LEVELS-1 = darkest (soft)."""
+    return min(TONE_LEVELS - 1, max(0, int((1.0 - gain) * TONE_LEVELS)))
+
+
+def vary_pick(note, gain=1.0):
+    """A pad's audio for one hit: darker for softer hits (VEL TONE) and one of a few
+    slightly detuned copies (VARY), when those are on and ready."""
     c = vary_cache.get(note)
     base = pitched[note]
-    if c is None or c[0][0] != id(base) or c[0][1] != padp[note].get("vary", 0):
+    if c is None or c[0] != variant_key(note):
         return base
-    return random.choice(c[1])
+    copies = c[1][tone_level(gain) if len(c[1]) > 1 else 0]
+    return random.choice(copies)
+
+
+def darken(audio, level, amount):
+    """Low-pass for VEL TONE: level 1..3 of 3, amount 0-100 % (100 % = softest hits at ~1.2 kHz)."""
+    from scipy.signal import butter, sosfilt
+    fc = 20000 * (0.06 ** (amount / 100)) ** (level / (TONE_LEVELS - 1))
+    sos = butter(2, min(fc, SR * 0.45), fs=SR, output="sos")
+    return sosfilt(sos, audio, axis=0).astype(np.float32)
 
 
 def vary_tick():
-    """Main loop: make the detuned copies (in a thread) for pads with VARY on."""
+    """Main loop: make the darker / detuned copies (in a thread) for pads with VARY or VEL TONE on."""
     for pid in list(pad_samples):
-        cents = padp[pid].get("vary", 0)
-        if not cents or is_inst(pid) or pid not in pitched:
+        cents, tone = padp[pid].get("vary", 0), padp[pid].get("tone", 0)
+        if not (cents or tone) or is_inst(pid) or pid not in pitched or len(pitched[pid]) > VARIANT_MAX_LEN:
             vary_cache.pop(pid, None)
             continue
         base = pitched[pid]
-        key = (id(base), cents)
-        if (vary_cache.get(pid) or ((None,),))[0] == key or vary_jobs.get(pid) == key:
+        key = variant_key(pid)
+        if (vary_cache.get(pid) or (None,))[0] == key or vary_jobs.get(pid) == key:
             continue
         vary_jobs[pid] = key
 
-        def work(pid=pid, base=base, key=key, cents=cents):
+        def work(pid=pid, base=base, key=key, cents=cents, tone=tone):
             try:
-                copies = [base if f == 0 else repitch(base, f * cents / 100) for f in VARY_SPREAD]
+                levels = [base] + ([darken(base, L, tone) for L in range(1, TONE_LEVELS)] if tone else [])
+                table = [[lv if f == 0 or not cents else repitch(lv, f * cents / 100) for f in VARY_SPREAD]
+                         for lv in levels]
             except Exception:
-                copies = None
-            if copies and vary_jobs.get(pid) == key:
-                vary_cache[pid] = (key, copies)
+                table = None
+            if table and vary_jobs.get(pid) == key:
+                vary_cache[pid] = (key, table)
             if vary_jobs.get(pid) == key:
                 vary_jobs.pop(pid, None)
         threading.Thread(target=work, daemon=True).start()
@@ -724,7 +748,7 @@ def trigger_sample(note, gain, offset=0, audio=None):
             if v.note is not None and padp[v.note]["choke"] == g and v.fade_left is None:
                 v.fade_left = FADE + offset
     pp = padp[note]
-    v = Voice(vary_pick(note) if audio is None else audio, gain, note, offset)   # gain = velocity only
+    v = Voice(vary_pick(note, gain) if audio is None else audio, gain, note, offset)   # gain = velocity only
     pad_flash[note] = time.monotonic() + offset / SR + audio_state["latency"]
     last_voice[note] = v
     if len(voices) >= MAX_VOICES:
@@ -1123,9 +1147,15 @@ def run_clock(frames):
         for pid, evs in melody.items():                 # keyboard notes starting in this step
             if pid not in pad_samples or not audible(pid):
                 continue
+            rolls = {}                                  # CHANCE: one roll per step (a chord drops together)
             for ev in evs:
                 pos, n, vel, length = ev
                 if int(pos) != step:
+                    continue
+                ns = int(round(pos)) % pattern_length()
+                if ns not in rolls:
+                    rolls[ns] = chance_roll(pid, ns)
+                if not rolls[ns]:
                     continue
                 if (pid, ev) in fresh_notes:
                     fresh_notes.discard((pid, ev))      # just recorded: you heard it live
@@ -1738,8 +1768,8 @@ PAGES = {
               lambda d: padp[sel()].update(choke=clamp(padp[sel()]["choke"] + d, 0, CHOKE_GROUPS)), per=4,
               show=lambda g: "OFF" if g == 0 else str(g), needs_pad=True)]},
     "FILTER": {"ready": True, "colour": (255, 150, 60), "knobs": [None] * 8},      # the pad's strip
-    "EQ": {"ready": True, "colour": (90, 200, 255), "knobs": [None] * 8},
-    "COMP": {"ready": True, "colour": (240, 90, 110), "knobs": [None] * 8},
+    "EQ": {"ready": True, "colour": (145, 255, 255), "knobs": [None] * 8},      # as calibrated on the Push
+    "COMP": {"ready": True, "colour": (255, 138, 110), "knobs": [None] * 8},
     "SAMPLE": {"ready": True, "colour": (232, 64, 58), "knobs": [
         Param("START", lambda: trim_bounds(sel())[0], lambda d: trim_move("start", d * trim_step()),
               show=lambda v: f"{v / SR:.3f} s", needs_pad=True),
@@ -2064,10 +2094,22 @@ def tap_tempo():
 held_steps = {}            # step pad note -> {"pad", "s", "existed", "edited"}
 
 
+def edit_chance(amount):
+    """Holding steps (drum or synth note) + the Master encoder: CHANCE, 5 % a tick."""
+    infos = held_any_steps()
+    checkpoint("step chance", key=("stepchance", tuple(sorted(held_steps)) + tuple(sorted(held_note_steps))))
+    for info in infos:
+        info["edited"] = True
+        p_, s_ = info["pad"], info["s"]
+        if pattern[p_][s_] or notes_at_step(p_, s_):
+            set_step_chance(p_, s_, clamp(step_chance(p_, s_) + 5 * amount, 0, 100))
+    mark_dirty()
+
+
 def edit_held_steps(knob, amount):
     """While step pads are held: knob 1 = velocity, knob 2 = nudge (early/late);
-    Shift + knob 1 = CHANCE (how often the step plays)."""
-    if knob == 0 and SHIFT_BUTTON in held_buttons:
+    the Master encoder (knob = "chance") = CHANCE, how often the step plays."""
+    if knob == "chance":
         checkpoint("step chance", key=("stepchance", tuple(sorted(held_steps))))
         for info in held_steps.values():
             info["edited"] = True
@@ -2103,17 +2145,19 @@ def quantize(whole_pattern=False):
     moved = 0
     g, L = grid_steps(), pattern_length()
     for n in notes:
-        hits = []                                       # (straight position, velocity)
+        hits = []                                       # (straight position, velocity, inside, chance)
         for i, ev in enumerate(pattern[n]):
+            ch_ = step_chance(n, i)
             for vel, nudge in step_hits(ev):
                 pos = i + nudge
                 gp = round(pos / g) * g
                 if abs(pos - gp) > 1e-6:
                     pos = gp if abs(pos - gp) < 0.02 else gp + (pos - gp) / 2
                     moved += 1
-                hits.append((pos, vel, i < L))
+                hits.append((pos, vel, i < L, ch_))
         pattern[n][:] = [None] * MAX_STEPS
-        for pos, vel, inside in hits:
+        auto_lanes.pop(f"chance:{n}", None)             # CHANCE goes where its hit goes
+        for pos, vel, inside, ch_ in hits:
             r = round(pos)
             step = r % L if inside else min(r, MAX_STEPS - 1)
             nudge = round(max(-MAX_NUDGE, min(MAX_NUDGE, pos - r)), 3)
@@ -2121,6 +2165,8 @@ def quantize(whole_pattern=False):
             if any(abs(h[1] - nudge) < 0.01 for h in have):   # landed on the same spot: keep one
                 continue
             pattern[n][step] = make_step(have + [(vel, nudge)])
+            if ch_ < 100 and not have:
+                set_step_chance(n, step, ch_)
     toast(("quantized pattern" if whole_pattern else f"quantized {pad_label(notes[0])}")
           + ("" if moved else "  ·  already on the grid"))
     mark_dirty()
@@ -3253,7 +3299,7 @@ def chop_apply():
         set_pad_sample(pid, f"{base}.{k + 1}", audio[a:b], pad_files[src], (offset + a, offset + b))
         padp[pid].update(volume=padp[src]["volume"], pan=padp[src]["pan"], mode=padp[src]["mode"],
                          mono_sum=padp[src]["mono_sum"], colour=padp[src]["colour"], choke=group,
-                         vary=padp[src].get("vary", 0))
+                         vary=padp[src].get("vary", 0), tone=padp[src].get("tone", 0))
     bank["cur"] = target
     pat["row"] = "banks"
     ui["selected"] = target * 16
@@ -3397,7 +3443,7 @@ def sampling_tick():
     set_pad_sample(pid, f"SMP {k:02d}", audio, path)
     auto_detect(pid, apply_root=True)
     padp[pid].update(volume=100, pan=0, swing=None, humanize=None, mode="one-shot", choke=0, mono_sum=False,
-                     fx=None, vary=0)
+                     fx=None, vary=0, tone=0)
     ui["selected"] = pid
     bank["cur"] = pid // 16
     smp["target"] = smp_target_default()                   # ready for the next one
@@ -3627,15 +3673,20 @@ def pattern_hits():
                 swing_delay = (2 * sw / 100 - 1) * spt if st % 2 == 1 else 0.0
                 late = random.uniform(0, hu * HUMANIZE_MAX_MS / 1000 * SR) if hu else 0.0
                 gain = vel / 127 * (1 - random.uniform(0, hu * HUMANIZE_MAX_GAIN))
-                aud = inst_render(note, 60, int(spt)) if is_inst(note) else vary_pick(note)
+                aud = inst_render(note, 60, int(spt)) if is_inst(note) else vary_pick(note, gain)
                 hits.append((int((st + nudge) * spt + swing_delay + late), note, gain, aud, None))
     for pid, evs in melody.items():                 # keyboard notes
         if pid not in pad_samples or not audible(pid):
             continue
         sw = padp[pid]["swing"] if padp[pid]["swing"] is not None else groove["swing"]
         hu = (padp[pid]["humanize"] if padp[pid]["humanize"] is not None else groove["humanize"]) / 100
+        rolls = {}
         for pos, n, vel, length in evs:
             q = int(round(pos)) % steps_n
+            if q not in rolls:
+                rolls[q] = chance_roll(pid, q)
+            if not rolls[q]:
+                continue
             swing_delay = (2 * sw / 100 - 1) * spt if q % 2 == 1 else 0.0
             late = random.uniform(0, hu * HUMANIZE_MAX_MS / 1000 * SR) if hu else 0.0
             gain = vel / 127 * (1 - random.uniform(0, hu * HUMANIZE_MAX_GAIN))
@@ -3808,7 +3859,7 @@ def resample():
     checkpoint(f"resample to {pad_label(pid)}")
     set_pad_sample(pid, f"RS {k:02d} P{pat['cur'] + 1}", audio, path)
     padp[pid].update(volume=100, pan=0, swing=None, humanize=None, mode="one-shot", choke=0, mono_sum=False,
-                     fx=None, vary=0)
+                     fx=None, vary=0, tone=0)
     bank["cur"] = pid // 16
     ui["selected"] = pid
     note = " (level lowered to avoid clipping)" if peak > 0.99 else ""
@@ -5015,7 +5066,10 @@ SETTINGS = {
         Param("VARY", lambda: padp[sel()].get("vary", 0),                # random pitch per hit (percs, hats)
               lambda d: padp[sel()].update(vary=clamp(padp[sel()].get("vary", 0) + 5 * d, 0, 100)),
               show=lambda v: "OFF" if v == 0 else f"±{v} ct", needs_pad=True),
-        None, None,
+        Param("VEL TONE", lambda: padp[sel()].get("tone", 0),               # softer hits = darker
+              lambda d: padp[sel()].update(tone=clamp(padp[sel()].get("tone", 0) + 5 * d, 0, 100)),
+              show=lambda v: "OFF" if v == 0 else f"{v}%", needs_pad=True),
+        None,
         Param("TO BANK", lambda: "TURN >", lambda d: copy_colour_to_bank(sel(), d), per=8, needs_pad=True)],
     "PATTERN": [None] * 8,
     "SAMPLE": [
@@ -5061,7 +5115,7 @@ SETTINGS = {
 
 HELP = {
     "kit": ["KIT · PATTERN", "Kit pads: play / select   ·   top 2 rows: steps of the selected pad",
-            "Hold a step: knob 1 velocity (Shift: CHANCE), knob 2 nudge   ·   Delete + pad: clear its steps",
+            "Hold a step: knob 1 velocity, knob 2 nudge, Master knob CHANCE   ·   Delete + pad: clear its steps",
             "Note / Scale: keyboard   ·   Accent: 16 levels   ·   Select: patterns / banks",
             "Hold Duplicate + a pad, then another pad: MOVE or COPY it there",
             "Convert: resample the pattern (hold a pad + Convert: that pad)   ·   Shift + Convert: stems",
@@ -5078,7 +5132,7 @@ HELP = {
              "STEMS: turn right = split into 4 pads (left = cancel)   ·   QUALITY: FAST or BEST (cleaner, ~5x slower)"],
     "keys": ["KEYBOARD", "Bottom 6 rows: notes (root in the pad colour)   ·   Octave Up/Down: octave",
              "Record + play: notes   ·   top 2 rows: steps with notes (tap: add the last note)",
-             "Hold a step: velocity, nudge, note, length, or press keys for a chord",
+             "Hold a step: velocity, nudge, note, length (Master knob: CHANCE), or press keys for a chord",
              "Delete + key: remove that note   ·   Setup: key + scale   ·   Session: back to the kit"],
     "pad": ["PAD PAGE", "VOLUME, PITCH, PAN, CHANNELS (stereo / mono) of the selected pad",
             "SWING, HUMAN: this pad's groove ('pattern' = follow the pattern)",
@@ -5149,7 +5203,7 @@ HELP = {
 
              "Turn right on TO BANK to copy the colour to every pad in the bank",
              "Settings page + Setup = General · knob 6 BUFFER: 128 / 256 / 512 - smaller = faster pads",
-             "Pad · knob 5 VARY: each hit a slightly different pitch (± cents) - percs, hats",
+             "Pad · knob 5 VARY: each hit a slightly different pitch · knob 6 VEL TONE: soft hits darker",
              "General · knob 7 PAD LEDS: pad brightness · knob 8 UNLIT: unselected pads (all projects)",
              "Setup again or a page button: close"],
     "levels": ["16 LEVELS", "The kit pads play the selected pad at 16 velocities, soft to hard",
@@ -5270,6 +5324,7 @@ def on_message(msg):
                 checkpoint(f"note step {info['s'] + 1}")
                 melody[info["pad"]] = [e for e in melody.get(info["pad"], [])
                                        if e not in notes_at_step(info["pad"], info["s"])]
+                set_step_chance(info["pad"], info["s"], 100)
                 mark_dirty()
             if pid is not None:
                 repeat["held"].pop(pid, None)
@@ -5752,6 +5807,8 @@ def on_message(msg):
             checkpoint("tempo", key="bpm")
             clock["bpm"] = max(BPM_MIN, min(BPM_MAX, clock["bpm"] + knob_steps("bpm", v, TICKS_PER_BPM)))
             mark_dirty()
+        elif c in VOLUME_KNOBS and (held_steps or held_note_steps):
+            edit_chance(v if v < 64 else v - 128)              # holding a step: Master knob = CHANCE
         elif c in VOLUME_KNOBS:
             step = v if v < 64 else v - 128
             master["volume"] = round(max(0.0, min(1.0, master["volume"] + step * VOLUME_STEP)), 2)
@@ -6119,7 +6176,8 @@ TRACK = 0.4                                    # letter spacing of caps labels
 
 # The Push's LEDs show colour differently from the screen (green comes out much
 # stronger), so the buttons get their own values, picked by eye with led_test.py.
-LED_COLOURS = {"PAD": (255, 0, 0), "SAMPLE": (255, 0, 0), "PATTERN": (0, 40, 255), "SETUP": (200, 200, 200)}
+LED_COLOURS = {"PAD": (255, 0, 0), "SAMPLE": (255, 0, 0), "PATTERN": (0, 40, 255), "SETUP": (200, 200, 200),
+               "EQ": (90, 200, 255), "COMP": (240, 90, 110)}     # button LEDs (the screen colours are tuned to match)
 
 SLOT_W = W // 8
 PAGE_LEDS = {}                        # page -> (bright palette index, dim palette index)
@@ -6471,9 +6529,9 @@ def draw_settings(d):
         draw_curve(d, 3 * SLOT_W + 3, "SETTINGS · GENERAL")  # pad response graph next to its knobs
         return
     if ctx == "PAD" and sel_ is not None:
-        x0 = title(5, 2, fit_text(f"{pad_name(sel_)}  {pad_label(sel_)}", F_BODY, 2 * SLOT_W - 66), TXT)
-        sx1 = x0 + 2 * SLOT_W - 12                          # the pad's colour
-        d.rectangle([sx1 - 44, 23, sx1, 51], fill=pad_screen_colour(sel_), outline=SEL_OUTLINE)
+        x0 = title(6, 1, fit_text(f"{pad_name(sel_)} {pad_label(sel_)}", F_BODY, SLOT_W - 34), TXT)
+        sx1 = x0 + SLOT_W - 12                              # the pad's colour
+        d.rectangle([sx1 - 14, 37, sx1, 51], fill=pad_screen_colour(sel_), outline=SEL_OUTLINE)
     elif ctx == "PATTERN":
         title(4, 3, "nothing here yet")
     elif ctx == "SCALE":
@@ -6517,6 +6575,7 @@ def draw_note_editor(d):
             ("VELOCITY", str(vel), ""), ("NUDGE", f"{'+' if nudge > 0 else ''}{round(nudge * 100)}", "%"),
             ("NOTE", note_name(n), chord), ("LENGTH", f"{length:g}", "STEPS" if length != 1 else "STEP")]):
         param_cell(d, slot, label, value, unit, fill=(CYAN, CYAN, VIOLET, CYAN)[slot] if slot else TXT)
+    draw_chance_chip(d, info)
     if any(step_knobs()):                          # knobs 5-8: this step's automation
         draw_step_auto(d, info)
         return
@@ -6578,8 +6637,9 @@ def draw_step_editor(d):
             if any(step_knobs()[:2]):                  # knobs 1-2 are settings too: the step in the tabs
                 d.rectangle([6 * SLOT_W, 0, W, 17], fill=BLACK)
                 caps(d, (6 * SLOT_W + 10, 2), f"STEP {info['s'] + 1} · " +
-                     " ".join(note_name(e[1]) for e in evs[:3]), RED)
+                     " ".join(note_name(e[1]) for e in evs[:2]), RED)
                 draw_step_auto(d, info)
+                draw_chance_chip(d, info)
                 return
             x = 6
             card(d, [x, 19, x + 2 * SLOT_W - 14, 52], pad_screen_colour(info["pad"]), side="top")
@@ -6587,21 +6647,29 @@ def draw_step_editor(d):
             d.text((x + 8, 33), " ".join(note_name(e[1]) for e in evs[:6]) or "-", font=F_BODY, fill=TXT)
             if not draw_step_auto(d, info):
                 hint_step_auto(d, info)
+            draw_chance_chip(d, info)
         return
     vel, nudge = step_event(ev)
     ms = nudge * samples_per_step() / SR * 1000
     many = f" +{len(held_steps) - 1}" if len(held_steps) > 1 else ""
-    ch = step_chance(info["pad"], info["s"])
-    if SHIFT_BUTTON in held_buttons:                     # Shift + knob 1 = CHANCE
-        first_cell = (f"STEP {info['s'] + 1}{many} CHANCE", str(ch), "%")
-    else:
-        first_cell = (f"STEP {info['s'] + 1}{many} VELO", str(vel), "" if ch >= 100 else f"· {ch}%")
+    draw_chance_chip(d, info)
     for slot, (label, value, unit) in enumerate([
-            first_cell,
+            (f"STEP {info['s'] + 1}{many} VELO", str(vel), ""),
             ("NUDGE", f"{'+' if nudge > 0 else ''}{round(nudge * 100)}", f"% {ms:+.0f}ms")]):
         param_cell(d, slot, label, value, unit, fill=CYAN if slot else TXT, label_fill=NAV if slot == 0 else GREY)
     if not draw_step_auto(d, info):
         hint_step_auto(d, info)
+
+
+def draw_chance_chip(d, info):
+    """CHANCE of the held step, over the 8th tab - next to the Master encoder that sets it."""
+    ch = step_chance(info["pad"], info["s"])
+    x0 = 7 * SLOT_W + 3
+    d.rectangle([x0 - 3, 0, W, 17], fill=BLACK)
+    d.rounded_rectangle([x0, 1, x0 + SLOT_W - 6, 16], 2, fill=RAISED if ch >= 100 else shade(MINT, PANEL, 0.25),
+                        outline=MINT if ch < 100 else BORDER)
+    d.text((x0 + 6, 9), "CHANCE", font=F_NAV, fill=GREY, anchor="lm")
+    d.text((x0 + SLOT_W - 12, 9), f"{ch}%", font=F_TAB, fill=TXT if ch >= 100 else MINT, anchor="rm")
 
 
 def hint_step_auto(d, info):
@@ -6972,8 +7040,12 @@ def draw_grid(d):
                 continue
             xa = x0 + max(0, start) * cw
             xb = x0 + min(cols, start + length) * cw
-            d.rectangle([xa + 1, y + 2, max(xa + 3, xb - 2), y + ROW_H - 4],
-                        fill=shade(on_colour, base, 0.4 + 0.6 * vel / 127))
+            nfill = shade(on_colour, base, 0.4 + 0.6 * vel / 127)
+            d.rectangle([xa + 1, y + 2, max(xa + 3, xb - 2), y + ROW_H - 4], fill=nfill)
+            ch = step_chance(note, int(round(pos)) % pattern_length())
+            if ch < 100:                                # CHANCE: only that share of the note is lit
+                xc = xa + 1 + (max(xa + 3, xb - 2) - xa - 1) * ch / 100
+                d.rectangle([xc, y + 3, max(xa + 3, xb - 2), y + ROW_H - 5], fill=shade(nfill, base, 0.3))
     if shown > 1:                                       # bar lines over the lanes
         for b in range(1, shown):
             xx = x0 + b * STEPS * cw - 1
@@ -7563,7 +7635,7 @@ def pad_bus(note):
 # padp[pad]["fx"] = {"FILTER": {"on", "p"}, "EQ": {...}, "COMP": {...}} or None.
 # ---------------------------------------------------------------------------
 PAD_FX = ("FILTER", "EQ", "COMP")
-PAD_FX_COLOURS = {"FILTER": (255, 150, 60), "EQ": (90, 200, 255), "COMP": (240, 90, 110)}
+PAD_FX_COLOURS = {"FILTER": (255, 150, 60), "EQ": (145, 255, 255), "COMP": (255, 138, 110)}
 PAD_EQ_BANDS = {0: "LOW", 2: "MID", 4: "HIGH"}
 
 
